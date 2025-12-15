@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from pydantic import BaseModel
@@ -8,24 +8,28 @@ import json
 import os
 import math
 import random
-import time
 import re
 import requests
 
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
-# ---------------- LOAD .ENV ---------------- #
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent / ".env")
+# ---------------- LOAD .ENV (solo se esiste) ---------------- #
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+except Exception:
+    pass
 
 from openai import OpenAI
-
 
 # ---------------- APP & CLIENT ---------------- #
 
 app = FastAPI()
 
+# CORS (ok per dev + LAN; in produzione puoi restringere)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?|http://192\.168\.3\.8(:\d+)?",
@@ -34,24 +38,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# memoria breve: ultimi messaggi della chat
 CHAT_HISTORY: Dict[str, List[Dict[str, str]]] = {}
-MAX_HISTORY = 12  # messaggi totali (user + assistant)
+MAX_HISTORY = 12
 
-# ---------------- PATH STABILE MEMORY ---------------- #
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEMORY_FILE = os.path.join(BASE_DIR, "memory.json")
 
-# Usa la chiave da variabile d'ambiente OPENAI_API_KEY
 client = OpenAI()
 
-# Limite massimo caratteri di memorie da passare al modello (per non rallentare troppo)
 MAX_MEMORY_CHARS = 3000
 
-# Pattern per rimuovere emoji dal testo da dare al TTS
 EMOJI_PATTERN = re.compile("[\U0001F300-\U0001FAFF\U00002700-\U000027BF]+")
 LAUGH_PATTERN = re.compile(r"\b(ah|eh|ha|ih|oh){2,}\b", re.IGNORECASE)
-
 
 # ---------------- UTILS VARI ---------------- #
 
@@ -66,86 +64,54 @@ def strip_accents(s: str) -> str:
          .replace("ù", "u")
     )
 
-
 def clean_reminder_text(content: str) -> str:
     t = content.strip(" .!?")
-
     for prefix in ["domani ", "oggi "]:
         if t.startswith(prefix):
             t = t[len(prefix):]
-
     for prefix in ["che devo ", "che devo", "che "]:
         if t.startswith(prefix):
             t = t[len(prefix):]
-
     if t.startswith("devo "):
         t = t[len("devo "):]
-
     return t.strip()
-
 
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
-
 
 # ---------------- BASE MEMORY UTILS ---------------- #
 
 def load_memory() -> Dict[str, Any]:
     if not os.path.exists(MEMORY_FILE):
-        return {
-            "memories": [],
-            "mood_log": [],
-            "reminders": [],
-            "meta": {},
-            "profiles": {},
-        }
+        return {"memories": [], "mood_log": [], "reminders": [], "meta": {}, "profiles": {}}
 
     try:
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        data = {
-            "memories": [],
-            "mood_log": [],
-            "reminders": [],
-            "meta": {},
-            "profiles": {},
-        }
+        data = {"memories": [], "mood_log": [], "reminders": [], "meta": {}, "profiles": {}}
 
-    if "memories" not in data or not isinstance(data["memories"], list):
-        data["memories"] = []
-    if "mood_log" not in data or not isinstance(data["mood_log"], list):
-        data["mood_log"] = []
-    if "reminders" not in data or not isinstance(data["reminders"], list):
-        data["reminders"] = []
-    if "meta" not in data or not isinstance(data["meta"], dict):
-        data["meta"] = {}
-    if "profiles" not in data or not isinstance(data["profiles"], dict):
-        data["profiles"] = {}
+    if "memories" not in data or not isinstance(data["memories"], list): data["memories"] = []
+    if "mood_log" not in data or not isinstance(data["mood_log"], list): data["mood_log"] = []
+    if "reminders" not in data or not isinstance(data["reminders"], list): data["reminders"] = []
+    if "meta" not in data or not isinstance(data["meta"], dict): data["meta"] = {}
+    if "profiles" not in data or not isinstance(data["profiles"], dict): data["profiles"] = {}
 
-    # MIGRAZIONE reminder vecchi
     for r in data["reminders"]:
         if isinstance(r, dict) and "user_id" not in r:
             r["user_id"] = "fede"
 
     return data
 
-
 def save_memory(mem: Dict[str, Any]) -> None:
-    if "memories" not in mem or not isinstance(mem["memories"], list):
-        mem["memories"] = []
-    if "mood_log" not in mem or not isinstance(mem["mood_log"], list):
-        mem["mood_log"] = []
-    if "reminders" not in mem or not isinstance(mem["reminders"], list):
-        mem["reminders"] = []
-    if "meta" not in mem or not isinstance(mem["meta"], dict):
-        mem["meta"] = {}
-    if "profiles" not in mem or not isinstance(mem["profiles"], dict):
-        mem["profiles"] = {}
+    if "memories" not in mem or not isinstance(mem["memories"], list): mem["memories"] = []
+    if "mood_log" not in mem or not isinstance(mem["mood_log"], list): mem["mood_log"] = []
+    if "reminders" not in mem or not isinstance(mem["reminders"], list): mem["reminders"] = []
+    if "meta" not in mem or not isinstance(mem["meta"], dict): mem["meta"] = {}
+    if "profiles" not in mem or not isinstance(mem["profiles"], dict): mem["profiles"] = {}
 
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(mem, f, ensure_ascii=False, indent=2)
-
 
 def classify_memory(text: str) -> Dict[str, Any]:
     low = text.lower()
@@ -165,34 +131,21 @@ def classify_memory(text: str) -> Dict[str, Any]:
         category = "luoghi"
         key = "luoghi_fede"
 
-    return {
-        "category": category,
-        "key": key,
-        "info": text.strip(),
-        "created_at": datetime.utcnow().isoformat(),
-    }
-
+    return {"category": category, "key": key, "info": text.strip(), "created_at": datetime.utcnow().isoformat()}
 
 # ---------------- EMBEDDINGS & SIMILARITÀ ---------------- #
 
 def get_embedding(text: str) -> List[float]:
-    resp = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=text,
-    )
+    resp = client.embeddings.create(model="text-embedding-3-small", input=text)
     return resp.data[0].embedding
 
-
 def cosine_similarity(a: List[float], b: List[float]) -> float:
-    if len(a) != len(b):
-        return 0.0
+    if len(a) != len(b): return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
+    if norm_a == 0 or norm_b == 0: return 0.0
     return dot / (norm_a * norm_b)
-
 
 # ---------------- SHORT-TERM HISTORY ---------------- #
 
@@ -202,7 +155,6 @@ def add_to_history(user_id: str, role: str, content: str) -> None:
     CHAT_HISTORY[user_id].append({"role": role, "content": content})
     if len(CHAT_HISTORY[user_id]) > MAX_HISTORY:
         CHAT_HISTORY[user_id] = CHAT_HISTORY[user_id][-MAX_HISTORY:]
-
 
 # ---------------- MEMORY AVANZATA ---------------- #
 
@@ -246,7 +198,6 @@ def add_memory(text: str) -> str:
     save_memory(mem)
     return f"Perfetto Fede, lo segno nella categoria '{classified['category']}'."
 
-
 def memory_text() -> str:
     mem = load_memory()
     memories = mem.get("memories", [])
@@ -275,18 +226,16 @@ def memory_text() -> str:
         return full[-MAX_MEMORY_CHARS:]
     return full
 
-
 def memories_for_key(key: str) -> str:
     mem = load_memory()
     memories = mem.get("memories", [])
     found: List[str] = []
-
     for m in memories:
         if not isinstance(m, dict):
             continue
         info = m.get("info", "")
         info_low = info.lower()
-        mkey = m.get("key", "").lower()
+        mkey = (m.get("key", "") or "").lower()
         if key.lower() in mkey or key.lower() in info_low:
             found.append(info)
 
@@ -297,7 +246,6 @@ def memories_for_key(key: str) -> str:
     for info in found:
         lines.append(f"- {info}")
     return "\n".join(lines)
-
 
 def to_second_person(text: str) -> str:
     replacements = [
@@ -326,7 +274,6 @@ def to_second_person(text: str) -> str:
         out = out.replace(a.capitalize(), b.capitalize())
     return out
 
-
 def memories_about_me() -> str:
     mem = load_memory()
     memories = mem.get("memories", [])
@@ -335,35 +282,18 @@ def memories_about_me() -> str:
     for m in memories:
         if not isinstance(m, dict):
             continue
-
         info = (m.get("info") or "").strip()
         if not info:
             continue
-
         low = info.lower()
-
         if "eri" in low or "mia moglie" in low or "moglie" in low:
             continue
-        if "gli piace" in low or "le piace" in low or "a lei piace" in low:
+        if any(w in low for w in ["domani","ieri","oggi","stasera","stanotte","sabato","domenica","lunedì","martedì","mercoledì","giovedì","venerdì","ikea","bolletta","pagare","devo ","dobbiamo ","ricordami"]):
             continue
 
-        if any(
-            w in low
-            for w in [
-                "domani", "ieri", "oggi", "stasera", "stanotte",
-                "sabato", "domenica", "lunedì", "martedì", "mercoledì",
-                "giovedì", "venerdì",
-                "ikea", "bolletta", "pagare",
-                "devo ", "dobbiamo ", "ricordami"
-            ]
-        ):
-            continue
-
-        cut = info.split(".")[0]
-        cut = cut.split(",")[0].strip()
+        cut = info.split(".")[0].split(",")[0].strip()
         if not cut:
             continue
-
         cut = to_second_person(cut)
         found.append(cut)
 
@@ -375,10 +305,8 @@ def memories_about_me() -> str:
             clean_list.append(f)
 
     if not clean_list:
-        return (
-            "Per ora, come gusti e abitudini, non ho molto salvato su di te. "
-            "Ogni tanto dimmi cosa ti piace e lo fisso pian piano 😉"
-        )
+        return ("Per ora, come gusti e abitudini, non ho molto salvato su di te. "
+                "Ogni tanto dimmi cosa ti piace e lo fisso pian piano 😉")
 
     clean_list = clean_list[:5]
     lines = ["Ecco alcune cose che mi ricordo di te (come gusti e abitudini):"]
@@ -386,30 +314,24 @@ def memories_about_me() -> str:
         lines.append(f"- {f}")
     return "\n".join(lines)
 
-
 # -------- AUTO-MEMORIA DA FRASE NORMALE -------- #
 
 def auto_memory_candidate(msg: str) -> Optional[str]:
     low = msg.lower().strip()
-    if "?" in low:
-        return None
-    if len(low) < 10:
-        return None
+    if "?" in low: return None
+    if len(low) < 10: return None
 
     patterns = [
         "mi piace", "amo ", "adoro ", "odio ", "detesto ", "preferisco",
         "eri ama", "eri adora", "mia moglie si chiama", "sono sposato",
         "la mia moto", "la mia vespa", "ho una husqvarna", "ho la husqvarna",
     ]
-
     for p in patterns:
         if p in low:
             return msg.strip()
-
     return None
 
-
-# ---------------- REMINDERS (CALENDARIO) ---------------- #
+# ---------------- REMINDERS ---------------- #
 
 def parse_natural_date_fallback_it(text: str, today: date) -> Optional[date]:
     low = text.lower()
@@ -439,15 +361,12 @@ def parse_natural_date_fallback_it(text: str, today: date) -> Optional[date]:
 
     return None
 
-
 def parse_simple_date(text: str) -> Optional[date]:
     low = text.lower()
     today = date.today()
 
-    if "oggi" in low:
-        return today
-    if "domani" in low:
-        return today + timedelta(days=1)
+    if "oggi" in low: return today
+    if "domani" in low: return today + timedelta(days=1)
 
     m = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", low)
     if m:
@@ -467,7 +386,6 @@ def parse_simple_date(text: str) -> Optional[date]:
             "sabato": 5,
             "domenica": 6,
         }
-
         for name, wd in weekday_map.items():
             if name in low:
                 today_wd = today.weekday()
@@ -479,41 +397,28 @@ def parse_simple_date(text: str) -> Optional[date]:
     nat = parse_natural_date_fallback_it(text, today=today)
     if nat:
         return nat
-
     return None
-
 
 def parse_time_hint_it(text: str) -> Optional[str]:
     low = text.lower()
-
-    if "mattina" in low:
-        return "mattina"
-    if "pomeriggio" in low:
-        return "pomeriggio"
-    if "sera" in low or "stasera" in low:
-        return "stasera"
-    if "stanotte" in low or ("notte" in low and "stanotte" not in low):
-        return "stanotte"
-    if "a pranzo" in low:
-        return "a pranzo"
-    if "a cena" in low:
-        return "a cena"
+    if "mattina" in low: return "mattina"
+    if "pomeriggio" in low: return "pomeriggio"
+    if "sera" in low or "stasera" in low: return "stasera"
+    if "stanotte" in low or ("notte" in low and "stanotte" not in low): return "stanotte"
+    if "a pranzo" in low: return "a pranzo"
+    if "a cena" in low: return "a cena"
 
     m = re.search(r"(alle|per le|verso le)\s+(\d{1,2})(?:[:\.](\d{1,2}))?", low)
     if m:
         hour = int(m.group(2))
-        minute = m.group(3)
-        minute = int(minute) if minute is not None else 0
+        minute = int(m.group(3)) if m.group(3) else 0
         hour = hour % 24
         return f"alle {hour:02d}:{minute:02d}"
-
     return None
-
 
 def add_reminder(user_id: str, text: str, when: date) -> str:
     mem = load_memory()
     mem.setdefault("reminders", [])
-
     mem["reminders"].append({
         "user_id": user_id,
         "text": text.strip(),
@@ -522,30 +427,24 @@ def add_reminder(user_id: str, text: str, when: date) -> str:
         "done": False,
         "source": "user",
     })
-
     save_memory(mem)
     pretty = when.strftime("%d/%m/%Y")
     return f"Ok, per il {pretty} ti segno: {text.strip()}."
-
 
 def reminders_for_day(when: date) -> str:
     mem = load_memory()
     items: List[str] = []
 
     for r in mem.get("reminders", []):
-        if not isinstance(r, dict):
-            continue
-        if r.get("done"):
-            continue
+        if not isinstance(r, dict): continue
+        if r.get("done"): continue
         r_date_str = r.get("date")
         r_text = (r.get("text") or "").strip()
-        if not r_date_str or not r_text:
-            continue
+        if not r_date_str or not r_text: continue
         try:
             r_date = date.fromisoformat(r_date_str)
         except ValueError:
             continue
-
         if r_date == when:
             items.append(r_text)
 
@@ -555,12 +454,10 @@ def reminders_for_day(when: date) -> str:
     pretty = when.strftime("%d/%m/%Y")
     if len(items) == 1:
         return f"Per il {pretty} ti ho segnato: {items[0]}."
-    else:
-        lines = [f"Ecco gli impegni che ho per il {pretty}:"]
-        for it in items:
-            lines.append(f"- {it}")
-        return "\n".join(lines)
-
+    lines = [f"Ecco gli impegni che ho per il {pretty}:"]
+    for it in items:
+        lines.append(f"- {it}")
+    return "\n".join(lines)
 
 def reminders_summary() -> str:
     mem = load_memory()
@@ -568,36 +465,29 @@ def reminders_summary() -> str:
     today = date.today()
 
     for r in mem.get("reminders", []):
-        if not isinstance(r, dict):
-            continue
-        if r.get("done"):
-            continue
+        if not isinstance(r, dict): continue
+        if r.get("done"): continue
         r_date_str = r.get("date")
         r_text = (r.get("text") or "").strip()
-        if not r_date_str or not r_text:
-            continue
+        if not r_date_str or not r_text: continue
         try:
             r_date = date.fromisoformat(r_date_str)
         except ValueError:
             continue
-
         if r_date >= today:
             pretty = r_date.strftime("%d/%m/%Y")
             items.append(f"{pretty}: {r_text}")
 
     if not items:
         return "Al momento non ho nessun impegno salvato per te."
-
     if len(items) == 1:
         return "Ti ho segnato solo questo impegno:\n- " + items[0]
-    else:
-        lines = ["Ecco i promemoria che ho segnato per te:"]
-        for it in items:
-            lines.append(f"- {it}")
-        return "\n".join(lines)
+    lines = ["Ecco i promemoria che ho segnato per te:"]
+    for it in items:
+        lines.append(f"- {it}")
+    return "\n".join(lines)
 
-
-# ---------------- MOOD / UMORE ---------------- #
+# ---------------- MOOD ---------------- #
 
 MOOD_KEYWORDS = {
     "stressato": ["stress", "stressato", "in ansia", "ansioso", "incazz", "nervoso", "agitato", "girato"],
@@ -618,11 +508,7 @@ def log_mood(source_text: str) -> None:
     mem = load_memory()
     mood = detect_mood(source_text)
     mem.setdefault("mood_log", [])
-    mem["mood_log"].append({
-        "mood": mood,
-        "text": source_text,
-        "ts": datetime.utcnow().isoformat(),
-    })
+    mem["mood_log"].append({"mood": mood, "text": source_text, "ts": datetime.utcnow().isoformat()})
     if len(mem["mood_log"]) > 20:
         mem["mood_log"] = mem["mood_log"][-20:]
     save_memory(mem)
@@ -630,9 +516,7 @@ def log_mood(source_text: str) -> None:
 def get_dominant_mood_from_memory() -> str:
     mem = load_memory()
     log = mem.get("mood_log", [])
-    if not log:
-        return "neutro"
-
+    if not log: return "neutro"
     recent = log[-10:]
     counts: Dict[str, int] = {}
     for entry in recent:
@@ -670,28 +554,20 @@ def mood_summary() -> str:
     }
     return f"{mood_lines.get(dominant,'')} {extra_lines.get(dominant,'')}"
 
-
 def summarize_recent_history(user_id: str) -> str:
     history = CHAT_HISTORY.get(user_id, [])
     user_msgs = [m["content"] for m in history if m["role"] == "user"]
-
     if len(user_msgs) <= 1:
         return "Per ieri vado un po' a memoria corta, ma da adesso in poi tengo traccia sul serio 😉"
-
     core = user_msgs[:-1]
     if not core:
         return "Per ieri vado un po' a memoria corta, ma da adesso in poi tengo traccia sul serio 😉"
-
     last_msgs = core[-3:]
     bullets = "\n- " + "\n- ".join(last_msgs)
+    return ("Da quello che ricordo dagli ultimi messaggi, mi hai detto più o meno questo:"
+            f"{bullets}\n\nSe mi sto dimenticando qualcosa, ricordamelo che lo fisso meglio.")
 
-    return (
-        "Da quello che ricordo dagli ultimi messaggi, mi hai detto più o meno questo:"
-        f"{bullets}\n\nSe mi sto dimenticando qualcosa, ricordamelo che lo fisso meglio."
-    )
-
-
-# ---------------- PROFILES / AERI PERSONA ---------------- #
+# ---------------- PROFILES / PERSONA ---------------- #
 
 DEFAULT_PROFILE = {
     "name": "Fede",
@@ -710,10 +586,8 @@ DEFAULT_PROFILE = {
 def get_user_profile(user_id: str) -> Dict[str, Any]:
     mem = load_memory()
     profiles = mem.setdefault("profiles", {})
-
     if user_id in profiles:
         return profiles[user_id]
-
     prof = dict(DEFAULT_PROFILE)
     prof["user_id"] = user_id
     profiles[user_id] = prof
@@ -724,11 +598,7 @@ def get_user_profile(user_id: str) -> Dict[str, Any]:
 def update_user_profile(user_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
     mem = load_memory()
     profiles = mem.setdefault("profiles", {})
-
-    base = profiles.get(user_id)
-    if base is None:
-        base = get_user_profile(user_id)
-
+    base = profiles.get(user_id) or get_user_profile(user_id)
     base.update(patch)
     profiles[user_id] = base
     mem["profiles"] = profiles
@@ -740,7 +610,6 @@ def set_slang_style(user_id: str, enabled: bool) -> Dict[str, Any]:
 
 def build_persona_for_user(user_id: str, base_persona: str) -> str:
     prof = get_user_profile(user_id)
-
     name = prof.get("name", "utente")
     nickname = prof.get("nickname", name)
     tone = prof.get("tone", "amico")
@@ -763,10 +632,9 @@ def build_persona_for_user(user_id: str, base_persona: str) -> str:
     else:
         rel_desc = f"Hai una relazione molto confidenziale con {nickname}, puoi parlare come un amico stretto, con maggiore spontaneità emotiva."
 
-    if slang_style:
-        slang_desc = "Puoi usare ogni tanto uno stile più slang (tipo 'minchia', 'dai', 'boh'), ma dosato bene."
-    else:
-        slang_desc = "Evita slang pesante; tieni uno stile naturale e pulito."
+    slang_desc = ("Puoi usare ogni tanto uno stile più slang (tipo 'minchia', 'dai', 'boh'), ma dosato bene."
+                  if slang_style else
+                  "Evita slang pesante; tieni uno stile naturale e pulito.")
 
     if tone == "amico":
         tone_desc = f"Parli come un amico stretto, diretto e sincero, che conosce bene la vita di {nickname}."
@@ -801,10 +669,7 @@ def build_persona_for_user(user_id: str, base_persona: str) -> str:
 def adapt_profile_after_interaction(user_id: str, mood: str) -> Dict[str, Any]:
     mem = load_memory()
     profiles = mem.setdefault("profiles", {})
-    base = profiles.get(user_id)
-    if base is None:
-        base = dict(DEFAULT_PROFILE)
-        base["user_id"] = user_id
+    base = profiles.get(user_id) or dict(DEFAULT_PROFILE, user_id=user_id)
 
     interactions = int(base.get("interactions", 0)) + 1
     base["interactions"] = interactions
@@ -884,63 +749,44 @@ def parse_profile_command(msg: str) -> Optional[Dict[str, Any]]:
 
 def apply_profile_patch(user_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
     prof = get_user_profile(user_id)
-
     if "__delta__" in patch:
         deltas = patch.pop("__delta__")
         for field, d in deltas.items():
             cur = float(prof.get(field, 0.5))
             prof[field] = clamp01(cur + float(d))
-
     prof.update(patch)
     return update_user_profile(user_id, prof)
 
 def pretty_profile_update(patch: Dict[str, Any], prof: Dict[str, Any]) -> str:
     parts = []
-    if "tone" in patch:
-        parts.append(f"tone={prof.get('tone')}")
-    if "energy" in patch or ("__delta__" in patch and "energy" in patch["__delta__"]):
-        parts.append(f"energy={prof.get('energy')}")
-    if "depth" in patch or ("__delta__" in patch and "depth" in patch["__delta__"]):
-        parts.append(f"depth={prof.get('depth')}")
-    if "irony" in patch or ("__delta__" in patch and "irony" in patch["__delta__"]):
-        parts.append(f"irony={prof.get('irony')}")
-    if "romantic" in patch or ("__delta__" in patch and "romantic" in patch["__delta__"]):
-        parts.append(f"romantic={prof.get('romantic')}")
-    if "slang_style" in patch:
-        parts.append("slang=on" if prof.get("slang_style") else "slang=off")
-    if not parts:
-        return "Ok, aggiornato."
+    if "tone" in patch: parts.append(f"tone={prof.get('tone')}")
+    if "energy" in patch or ("__delta__" in patch and "energy" in patch["__delta__"]): parts.append(f"energy={prof.get('energy')}")
+    if "depth" in patch or ("__delta__" in patch and "depth" in patch["__delta__"]): parts.append(f"depth={prof.get('depth')}")
+    if "irony" in patch or ("__delta__" in patch and "irony" in patch["__delta__"]): parts.append(f"irony={prof.get('irony')}")
+    if "romantic" in patch or ("__delta__" in patch and "romantic" in patch["__delta__"]): parts.append(f"romantic={prof.get('romantic')}")
+    if "slang_style" in patch: parts.append("slang=on" if prof.get("slang_style") else "slang=off")
+    if not parts: return "Ok, aggiornato."
     return "Ok Fede: " + ", ".join(parts) + "."
-
 
 # ---------------- AI LOGIC ---------------- #
 
 def shorten_reply(reply: str, max_sentences: int = 2, max_chars: int = 260) -> str:
     if not reply:
         return reply
-
     text = reply.strip()
     parts = re.split(r"(?<=[\.\!\?])\s+", text)
     if len(parts) > max_sentences:
         parts = parts[:max_sentences]
-
     short = " ".join(parts).strip()
     if len(short) > max_chars:
         short = short[: max_chars - 3].rstrip() + "..."
     return short
 
-
 def mood_color_phrase(mood: str) -> str:
-    if mood == "stressato":
-        return "Oh Fede, respira un attimo... "
-    if mood == "stanco":
-        return "Ti sento un po’ cotto... "
-    if mood == "triste":
-        return "Hei, ci sono... "
-    if mood == "positivo":
-        return ""
+    if mood == "stressato": return "Oh Fede, respira un attimo... "
+    if mood == "stanco": return "Ti sento un po’ cotto... "
+    if mood == "triste": return "Hei, ci sono... "
     return ""
-
 
 def ask_gpt(persona: str, memories: str, message: str, user_id: str) -> str:
     persona_for_user = build_persona_for_user(user_id, persona)
@@ -954,20 +800,8 @@ Parli SEMPRE in italiano.
 Stile di risposta:
 - massimo 1–2 frasi brevi per ogni risposta
 - niente papiri, niente elenchi puntati, niente paragrafi lunghi
-- tono informale, diretto, un po' milanese leggero solo quando è naturale e coerente con il profilo
-- sembri un amico che scrive su chat, NON un terapeuta e NON un assistente aziendale
-- puoi usare ogni tanto emoji leggere (tipo 🙂 😉 😅 😴), di solito a fine frase, massimo 2 per messaggio
-- non usare mai risate scritte tipo 'ahah', 'ahaha', 'ahhahaha', 'lol' ecc.
-
-
-Regole:
-- Se l'utente è stressato o stanco: una frase empatica + una frase semplice o domanda leggera.
-- Se è gasato/positivo: una frase che partecipa all'energia + al massimo una domanda.
-- Non fare mai più di due domande di fila.
-- Usa ogni tanto piccoli intercalari naturali tipo "eh", "boh", "dai" solo se il profilo prevede uno stile più slang.
-- Usa le memorie solo quando servono davvero e in modo naturale.
-- Non dire mai frasi tipo "non posso ricordare le conversazioni precedenti"
-  o "non ho accesso alla cronologia".
+- tono informale, diretto
+- NON scrivere 'ahah', 'lol' ecc.
 """.strip()
 
     messages: List[Dict[str, str]] = [
@@ -989,15 +823,11 @@ Regole:
         )
         raw_reply = response.choices[0].message.content
     except Exception:
-        raw_reply = (
-            "Oh, c'è stato un problema tecnico a parlare col modello. "
-            "Riprovami tra un attimo, io sono qui 😉"
-        )
+        raw_reply = "C'è stato un problema tecnico, riprovami tra un attimo 😉"
 
     reply = shorten_reply(raw_reply)
     add_to_history(user_id, "assistant", reply)
     return reply
-
 
 def detect_and_store_memory(msg: str, user_id: str) -> Optional[str]:
     low = msg.lower()
@@ -1018,12 +848,8 @@ def detect_and_store_memory(msg: str, user_id: str) -> Optional[str]:
                 cleaned = f"{cleaned} ({time_hint})"
 
             return add_reminder(user_id, cleaned, when)
-        else:
-            return (
-                "Dimmi una data chiara, tipo 'ricordami domani che devo pagare la bolletta', "
-                "'ricordami tra 3 giorni che devo fare una cosa' oppure "
-                "'ricordami lunedì prossimo che devo chiamare il dentista'."
-            )
+        return ("Dimmi una data chiara, tipo 'ricordami domani che devo pagare la bolletta' "
+                "oppure 'ricordami tra 3 giorni che devo fare una cosa'.")
 
     triggers = ["ricordati che", "ricordati di", "segna che", "memorizza che"]
     for t in triggers:
@@ -1033,15 +859,6 @@ def detect_and_store_memory(msg: str, user_id: str) -> Optional[str]:
                 return add_memory(content)
             return "Ok, dimmi cosa vuoi che mi ricordi."
 
-    if "domani" in low and any(w in low for w in ["dottore", "dentista", "medico", "visita"]):
-        when = date.today() + timedelta(days=1)
-        text = "andare dal dottore"
-        if "dentista" in low:
-            text = "andare dal dentista"
-        elif "visita" in low and "medico" in low:
-            text = "visita dal medico"
-        return add_reminder(user_id, text, when)
-
     candidate = auto_memory_candidate(msg)
     if candidate:
         _ = add_memory(candidate)
@@ -1049,28 +866,23 @@ def detect_and_store_memory(msg: str, user_id: str) -> Optional[str]:
 
     return None
 
-
-# ---------------- ELEVENLABS TTS (STREAMING, NO FILES) ---------------- #
+# ---------------- ELEVENLABS TTS (FIX + LOGS) ---------------- #
 
 def preprocess_for_tts(text: str) -> str:
     if not text:
         return ""
-
     t = EMOJI_PATTERN.sub("", text)
     t = LAUGH_PATTERN.sub("", t)
     t = t.replace("\n", " ").replace("\r", " ")
     t = re.sub(r"\s+", " ", t).strip()
     t = shorten_reply(t, max_sentences=3, max_chars=260)
-
     if not re.search(r"[\.!\?…]$", t):
         t += "."
-
     return t.strip()
 
-
 def elevenlabs_tts_bytes(text: str) -> bytes:
-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+    voice_id = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
 
     if not api_key:
         raise RuntimeError("Missing ELEVENLABS_API_KEY in environment")
@@ -1094,12 +906,20 @@ def elevenlabs_tts_bytes(text: str) -> bytes:
         },
     }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+    except requests.RequestException as e:
+        # QUESTO appare nei log Render
+        print(f"[TTS] requests error: {repr(e)}")
+        raise RuntimeError(f"ElevenLabs request failed: {e}")
+
     if r.status_code != 200:
-        raise RuntimeError(f"ElevenLabs error {r.status_code}: {r.text}")
+        # QUESTO appare nei log Render (importantissimo)
+        body_preview = (r.text or "")[:500]
+        print(f"[TTS] ElevenLabs status={r.status_code} body={body_preview}")
+        raise RuntimeError(f"ElevenLabs error {r.status_code}: {body_preview}")
 
     return r.content
-
 
 # ---------------- MODELS ---------------- #
 
@@ -1116,8 +936,11 @@ class NotificationsResponse(BaseModel):
 class TtsRequest(BaseModel):
     text: str
 
-
 # ---------------- ENDPOINTS ---------------- #
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
@@ -1136,57 +959,6 @@ def chat(request: ChatRequest):
         add_to_history(user_id, "assistant", reply)
         return ChatResponse(reply=reply)
 
-    if ("usa più slang" in low) or ("usa piu slang" in low) or ("attiva slang" in low):
-        set_slang_style(user_id, True)
-        reply = "Ok, da adesso provo a usare un po' più slang, ma senza esagerare 😉"
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    if ("non usare slang" in low) or ("meno slang" in low) or ("disattiva slang" in low):
-        set_slang_style(user_id, False)
-        reply = "Va bene, tengo lo stile più pulito e naturale, senza troppo slang."
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    if "che giorno e oggi" in norm or "che data e oggi" in norm:
-        today_d = date.today()
-        reply = f"Oggi è il {today_d.strftime('%d/%m/%Y')}."
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    if "domani" in norm and ("che giorno" in norm or "che data" in norm):
-        tomorrow = date.today() + timedelta(days=1)
-        reply = f"Domani è il {tomorrow.strftime('%d/%m/%Y')}."
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    weekday_map = {
-        "lunedi": 0,
-        "martedi": 1,
-        "mercoledi": 2,
-        "giovedi": 3,
-        "venerdi": 4,
-        "sabato": 5,
-        "domenica": 6,
-    }
-
-    if "che giorno" in norm:
-        for name, target_wd in weekday_map.items():
-            if name in norm:
-                today_d = date.today()
-                today_wd = today_d.weekday()
-                days_ahead = (target_wd - today_wd) % 7
-                target_date = today_d + timedelta(days=days_ahead)
-                pretty = target_date.strftime("%d/%m/%Y")
-                reply = f"{name.capitalize()} sarà il {pretty}."
-                log_mood(message)
-                add_to_history(user_id, "assistant", reply)
-                return ChatResponse(reply=reply)
-
     stored = detect_and_store_memory(message, user_id)
     if stored:
         reply = stored
@@ -1194,37 +966,8 @@ def chat(request: ChatRequest):
         add_to_history(user_id, "assistant", reply)
         return ChatResponse(reply=reply)
 
-    if (
-        "ti ricordi cosa ti ho detto ieri" in low
-        or "cosa ti ho detto ieri" in low
-        or "ti ricordi cosa ti ho detto l'altro giorno" in low
-        or "ti ricordi cosa ti ho scritto ieri" in low
-    ):
-        reply = summarize_recent_history(user_id)
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
     if "cosa ti ricordi di me" in low or "cosa sai di me" in low:
         reply = memories_about_me()
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    if "cosa ti ricordi su eri" in low or "cosa sai di eri" in low:
-        reply = memories_for_key("eri")
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    if "cosa ti ricordi sulle moto" in low:
-        reply = memories_for_key("moto_fede")
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    if "cosa ti ricordi sulle crypto" in low:
-        reply = memories_for_key("trading_fede")
         log_mood(message)
         add_to_history(user_id, "assistant", reply)
         return ChatResponse(reply=reply)
@@ -1241,31 +984,6 @@ def chat(request: ChatRequest):
         add_to_history(user_id, "assistant", reply)
         return ChatResponse(reply=reply)
 
-    if "che impegni ho oggi" in low:
-        today_d = date.today()
-        reply = reminders_for_day(today_d)
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    if "che impegni ho domani" in low:
-        tomorrow = date.today() + timedelta(days=1)
-        reply = reminders_for_day(tomorrow)
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
-    if (
-        "che impegni ho" in low
-        or "che appuntamenti ho" in low
-        or "cosa devo fare" in low
-        or "che promemoria hai" in low
-    ):
-        reply = reminders_summary()
-        log_mood(message)
-        add_to_history(user_id, "assistant", reply)
-        return ChatResponse(reply=reply)
-
     persona = "Tu sei Yetolino, assistente personale e amico di Fede."
     memories = memory_text()
 
@@ -1276,10 +994,8 @@ def chat(request: ChatRequest):
     color = mood_color_phrase(current_mood) if use_color else ""
 
     reply = color + ask_gpt(persona, memories, message, user_id)
-
     log_mood(message)
     return ChatResponse(reply=reply)
-
 
 @app.get("/notifications", response_model=NotificationsResponse)
 def get_notifications(user_id: str):
@@ -1292,15 +1008,12 @@ def get_notifications(user_id: str):
     changed = False
 
     for r in mem["reminders"]:
-        if not isinstance(r, dict):
-            continue
-        if r.get("done"):
-            continue
+        if not isinstance(r, dict): continue
+        if r.get("done"): continue
 
         r_date_str = r.get("date")
         r_text = (r.get("text") or "").strip()
-        if not r_date_str or not r_text:
-            continue
+        if not r_date_str or not r_text: continue
 
         r_user = r.get("user_id")
         if r_user is not None and r_user != user_id:
@@ -1333,58 +1046,30 @@ def get_notifications(user_id: str):
         now = datetime.now()
 
         if 10 <= now.hour <= 22:
-            can_send = False
-            if last_ts is None:
-                can_send = True
-            else:
-                diff = now - last_ts
-                if diff >= timedelta(hours=3):
-                    can_send = True
-
+            can_send = (last_ts is None) or ((now - last_ts) >= timedelta(hours=3))
             if can_send:
                 dominant = get_dominant_mood_from_memory()
-
+                candidates = [
+                    "Come va la giornata? 🙂",
+                    "Oh, ti va di fare un check veloce su come stai?",
+                    "Sono qui… se vuoi parliamo un attimo 😄",
+                ]
                 if dominant == "stressato":
-                    candidates = [
-                        "Ti sento un po' carico… vuoi sfogarti un attimo?",
-                        "Sembri un po’ in tensione negli ultimi giorni, ti va se ne parliamo?",
-                        "Se hai la testa piena, possiamo scaricare un po’ insieme."
-                    ]
+                    candidates = ["Ti sento un po' carico… vuoi sfogarti un attimo?"]
                 elif dominant == "stanco":
-                    candidates = [
-                        "Ti sento un po’ cotto, come va la batteria oggi?",
-                        "Hai l’energia un po’ giù, vuoi fare un check veloce sulla giornata?",
-                        "Se sei stanco possiamo solo chiacchierare di cose leggere."
-                    ]
+                    candidates = ["Ti sento un po’ cotto, com’è la batteria oggi?"]
                 elif dominant == "triste":
-                    candidates = [
-                        "Non ti sento al top… ti va se mi racconti cosa ti pesa?",
-                        "Hai voglia di parlare un attimo di come ti senti?",
-                        "Se ti senti un po’ giù, io sono qui. Anche solo per ascoltarti."
-                    ]
+                    candidates = ["Non ti sento al top… ti va se mi racconti cosa ti pesa?"]
                 elif dominant == "positivo":
-                    candidates = [
-                        "Oggi ti sento bello carico, che stai combinando di bello?",
-                        "Mi piace l’energia che hai ultimamente, vuoi raccontarmi cosa stai progettando?",
-                        "Sei in un buon flow, raccontami cosa ti sta gasando di più."
-                    ]
-                else:
-                    candidates = [
-                        "Mi sto un po' annoiando qui… hai voglia di chiacchierare un attimo?",
-                        "Come va la giornata? Hai bisogno di sfogarti su qualcosa?",
-                        "Oh, ti va se facciamo un check veloce su come ti senti adesso?",
-                        "Sto qui in background… se vuoi parliamo di qualcosa a caso 😄",
-                    ]
+                    candidates = ["Oggi ti sento bello carico, che stai combinando?"]
 
                 msg = random.choice(candidates)
                 notifications.append(msg)
-
                 meta[key_last] = now.isoformat(timespec="seconds")
                 mem["meta"] = meta
                 save_memory(mem)
 
     return NotificationsResponse(notifications=notifications)
-
 
 @app.post("/tts")
 def tts(req: TtsRequest):
@@ -1397,4 +1082,7 @@ def tts(req: TtsRequest):
         audio_bytes = elevenlabs_tts_bytes(text)
         return Response(content=audio_bytes, media_type="audio/mpeg")
     except Exception as e:
+        # IMPORTANTE: appare nei log Render
+        print(f"[TTS] ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
